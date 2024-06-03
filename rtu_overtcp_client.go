@@ -192,24 +192,6 @@ func calculateCRC(data []byte) uint16 {
 	return crc
 }
 
-//// calculateResponseLength calculates the response length based on the request
-//func calculateResponseLength(request []byte) int {
-//	// Implementation depends on Modbus function code and data length
-//	function := request[1]
-//	switch function {
-//	case 0x01, 0x02:
-//		return 5 + int(request[4]) + 2 // Address + Function + Byte Count + Data + CRC
-//	case 0x03, 0x04:
-//		return 5 + int(request[4])*2 + 2 // Address + Function + Byte Count + Data + CRC
-//	case 0x05, 0x06:
-//		return 8 // Address + Function + Output Address + Output Value + CRC
-//	case 0x0F, 0x10:
-//		return 8 // Address + Function + Starting Address + Quantity of Registers + CRC
-//	default:
-//		return rtuMinSize // Address + Function + CRC
-//	}
-//}
-
 // 计算请求和响应之间的延迟时间
 func (mb *rtuTcpTransporter) calculateDelay(byteCount int) time.Duration {
 	// 具体实现需要根据通信速度和数据长度来计算延迟时间

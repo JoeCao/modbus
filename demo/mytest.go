@@ -11,11 +11,11 @@ import (
 )
 
 const (
-	my_tcpDevice = "127.0.0.1:502"
+	my_tcpDevice = "192.168.1.95:502"
 )
 
 func main() {
-	err := Read()
+	err := RTUTCPRead()
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -32,7 +32,7 @@ func Read() error {
 	}
 	defer handler.Close()
 	client := modbus.NewClient(handler)
-	results, err := client.ReadHoldingRegisters(1, 1)
+	results, err := client.ReadHoldingRegisters(2, 1)
 	if err != nil || results == nil {
 		return fmt.Errorf("failed to read holding registers: %w", err)
 	}
@@ -52,5 +52,21 @@ func Read() error {
 	//value := int16(binary.BigEndian.Uint16(results))
 	//fmt.Println("Converted int16 value:", value)
 
+	return nil
+}
+
+func RTUTCPRead() error {
+	handler := modbus.NewRTUTCPClientHandler(my_tcpDevice)
+	handler.Timeout = 5 * time.Second
+	handler.SlaveId = 1
+	handler.Logger = log.New(os.Stdout, "tcp: ", log.LstdFlags)
+	err := handler.Connect()
+	defer handler.Close()
+	client := modbus.NewClient(handler)
+	results, err := client.ReadHoldingRegisters(1, 1)
+	if err != nil || results == nil {
+		return fmt.Errorf("failed to read holding registers: %w", err)
+	}
+	fmt.Println(results)
 	return nil
 }

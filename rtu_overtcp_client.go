@@ -1,11 +1,19 @@
 package modbus
 
-import "fmt"
+import (
+	"encoding/binary"
+	"fmt"
+	"io"
+	"log"
+	"net"
+	"sync"
+	"time"
+)
 
 // RTUTCPClientHandler implements Packager and Transporter interface.
 type RTUTCPClientHandler struct {
 	rtuPackager
-	tcpTransporter
+	rtuTcpTransporter
 }
 
 // NewRTUTCPClientHandler allocates and initializes a RTUTCPClientHandler.
@@ -76,4 +84,221 @@ func (mb *RTUTCPClientHandler) Decode(adu []byte) (pdu *ProtocolDataUnit, err er
 	pdu.FunctionCode = adu[1]
 	pdu.Data = adu[2 : length-2]
 	return
+}
+
+// rtuTcpTransporter implements Transporter interface.
+type rtuTcpTransporter struct {
+	// Connect string
+	Address string
+	// Connect & Read timeout
+	Timeout time.Duration
+	// Idle timeout to close the connection
+	IdleTimeout time.Duration
+	// Transmission logger
+	Logger *log.Logger
+
+	// TCP connection
+	mu           sync.Mutex
+	conn         net.Conn
+	closeTimer   *time.Timer
+	lastActivity time.Time
+}
+
+func (mb *rtuTcpTransporter) Send(aduRequest []byte) (aduResponse []byte, err error) {
+	mb.mu.Lock()
+	defer mb.mu.Unlock()
+
+	// Ensure connection is established
+	if err = mb.connect(); err != nil {
+		return
+	}
+	// Start the timer to close when idle
+	mb.lastActivity = time.Now()
+	mb.startCloseTimer()
+	// Set write and read timeout
+	var timeout time.Time
+	if mb.Timeout > 0 {
+		timeout = mb.lastActivity.Add(mb.Timeout)
+	}
+	if err = mb.conn.SetDeadline(timeout); err != nil {
+		return
+	}
+	// Send the request
+	mb.logf("modbus: sending % x\n", aduRequest)
+	if _, err = mb.conn.Write(aduRequest); err != nil {
+		return
+	}
+
+	function := aduRequest[1]
+	functionFail := aduRequest[1] & 0x80
+	bytesToRead := calculateResponseLength(aduRequest)
+	time.Sleep(mb.calculateDelay(len(aduRequest) + bytesToRead))
+
+	var n int
+	var n1 int
+	var data [rtuMaxSize]byte
+	// Read the minimum length first
+	n, err = io.ReadAtLeast(mb.conn, data[:], rtuMinSize)
+	if err != nil {
+		return
+	}
+	// If the function is correct
+	if data[1] == function {
+		// Read the rest of the bytes
+		if n < bytesToRead {
+			if bytesToRead > rtuMinSize && bytesToRead <= rtuMaxSize {
+				if bytesToRead > n {
+					n1, err = io.ReadFull(mb.conn, data[n:bytesToRead])
+					n += n1
+				}
+			}
+		}
+	} else if data[1] == functionFail {
+		// For error response, read 5 bytes
+		if n < rtuExceptionSize {
+			n1, err = io.ReadFull(mb.conn, data[n:rtuExceptionSize])
+		}
+		n += n1
+	}
+
+	if err != nil {
+		return
+	}
+
+	// Verify CRC
+	crc := calculateCRC(data[:n-2])
+	if binary.LittleEndian.Uint16(data[n-2:]) != crc {
+		err = fmt.Errorf("modbus: CRC check failed, expected '%x', got '%x'", crc, data[n-2:])
+		return
+	}
+	aduResponse = data[:n]
+	mb.logf("modbus: received % x\n", aduResponse)
+	return
+}
+
+// calculateCRC calculates the Modbus RTU frame's CRC
+func calculateCRC(data []byte) uint16 {
+	var crc uint16 = 0xFFFF
+	for _, b := range data {
+		crc ^= uint16(b)
+		for i := 0; i < 8; i++ {
+			if (crc & 1) != 0 {
+				crc = (crc >> 1) ^ 0xA001
+			} else {
+				crc >>= 1
+			}
+		}
+	}
+	return crc
+}
+
+//// calculateResponseLength calculates the response length based on the request
+//func calculateResponseLength(request []byte) int {
+//	// Implementation depends on Modbus function code and data length
+//	function := request[1]
+//	switch function {
+//	case 0x01, 0x02:
+//		return 5 + int(request[4]) + 2 // Address + Function + Byte Count + Data + CRC
+//	case 0x03, 0x04:
+//		return 5 + int(request[4])*2 + 2 // Address + Function + Byte Count + Data + CRC
+//	case 0x05, 0x06:
+//		return 8 // Address + Function + Output Address + Output Value + CRC
+//	case 0x0F, 0x10:
+//		return 8 // Address + Function + Starting Address + Quantity of Registers + CRC
+//	default:
+//		return rtuMinSize // Address + Function + CRC
+//	}
+//}
+
+// 计算请求和响应之间的延迟时间
+func (mb *rtuTcpTransporter) calculateDelay(byteCount int) time.Duration {
+	// 具体实现需要根据通信速度和数据长度来计算延迟时间
+	// 此处仅为示例，实际需要根据通信环境进行调整
+	return time.Duration(byteCount) * time.Millisecond
+}
+
+// Connect establishes a new connection to the address in Address.
+// Connect and Close are exported so that multiple requests can be done with one session
+func (mb *rtuTcpTransporter) Connect() error {
+	mb.mu.Lock()
+	defer mb.mu.Unlock()
+
+	return mb.connect()
+}
+
+func (mb *rtuTcpTransporter) connect() error {
+	if mb.conn == nil {
+		dialer := net.Dialer{Timeout: mb.Timeout}
+		conn, err := dialer.Dial("tcp", mb.Address)
+		if err != nil {
+			return err
+		}
+		mb.conn = conn
+	}
+	return nil
+}
+
+func (mb *rtuTcpTransporter) startCloseTimer() {
+	if mb.IdleTimeout <= 0 {
+		return
+	}
+	if mb.closeTimer == nil {
+		mb.closeTimer = time.AfterFunc(mb.IdleTimeout, mb.closeIdle)
+	} else {
+		mb.closeTimer.Reset(mb.IdleTimeout)
+	}
+}
+
+// Close closes current connection.
+func (mb *rtuTcpTransporter) Close() error {
+	mb.mu.Lock()
+	defer mb.mu.Unlock()
+
+	return mb.close()
+}
+
+// flush flushes pending data in the connection,
+// returns io.EOF if connection is closed.
+func (mb *rtuTcpTransporter) flush(b []byte) (err error) {
+	if err = mb.conn.SetReadDeadline(time.Now()); err != nil {
+		return
+	}
+	// Timeout setting will be reset when reading
+	if _, err = mb.conn.Read(b); err != nil {
+		// Ignore timeout error
+		if netError, ok := err.(net.Error); ok && netError.Timeout() {
+			err = nil
+		}
+	}
+	return
+}
+
+func (mb *rtuTcpTransporter) logf(format string, v ...interface{}) {
+	if mb.Logger != nil {
+		mb.Logger.Printf(format, v...)
+	}
+}
+
+// closeLocked closes current connection. Caller must hold the mutex before calling this method.
+func (mb *rtuTcpTransporter) close() (err error) {
+	if mb.conn != nil {
+		err = mb.conn.Close()
+		mb.conn = nil
+	}
+	return
+}
+
+// closeIdle closes the connection if last activity is passed behind IdleTimeout.
+func (mb *rtuTcpTransporter) closeIdle() {
+	mb.mu.Lock()
+	defer mb.mu.Unlock()
+
+	if mb.IdleTimeout <= 0 {
+		return
+	}
+	idle := time.Now().Sub(mb.lastActivity)
+	if idle >= mb.IdleTimeout {
+		mb.logf("modbus: closing connection due to idle timeout: %v", idle)
+		mb.close()
+	}
 }
